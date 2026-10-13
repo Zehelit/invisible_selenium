@@ -14,6 +14,8 @@ import base64
 import os
 from typing import Any, Dict, List, Optional
 
+from invisible_core.juggler.connection import Interrupted, ProtocolError
+
 from ... import _bridge
 from ...common import exceptions as exc
 from ...webdriver.common.by import By
@@ -26,7 +28,8 @@ from ...webdriver.common.by import By
 #: `paintTree` is the elements at that centre of the first client rect
 #: (`dom.getPointerInteractablePaintTree`); `inView` is whether the element is
 #: in it (`dom.isInView`, with its <tr> case); `scrollIntoView` is block end,
-#: inline nearest (`dom.scrollIntoView`).
+#: inline nearest (`dom.scrollIntoView`); `disabled` is `dom.isDisabled`, an
+#: <option> or <optgroup> that is not disabled itself taking its group's.
 #: ⛔ ONE DEPARTURE: Marionette sets `pointer-events: auto` on the element for
 #: the in-view test and puts the style back, which a page sees as two attribute
 #: mutations. Here an element with `pointer-events: none` counts as in view
@@ -71,6 +74,17 @@ _DOM = """
   };
   const scrollIntoView = (e) => {
     if (e.scrollIntoView) e.scrollIntoView({behavior: 'instant', block: 'end', inline: 'nearest'});
+  };
+  const disabled = (e) => {
+    if (!e || e.nodeType !== 1 ||
+        e.namespaceURI === 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul') {
+      return false;
+    }
+    if ((e.localName === 'option' || e.localName === 'optgroup') && !e.disabled) {
+      const group = e.parentElement && e.parentElement.closest('optgroup, select');
+      return disabled(group);
+    }
+    return e.matches(':disabled');
   };
 """
 
@@ -135,13 +149,6 @@ _CLICK_CHECKS = _with_dom("""
 #: which case Marionette does not even focus it. Answers "clear", "empty", or
 #: why it was refused.
 _CLEAR_CHECKS = _with_dom("""
-  const disabled = (e) => {
-    if ((e.localName === 'option' || e.localName === 'optgroup') && !e.disabled) {
-      const group = e.parentElement && e.parentElement.closest('optgroup, select');
-      return group ? disabled(group) : false;
-    }
-    return e.matches(':disabled');
-  };
   const readOnly = (e) => ['input', 'textarea'].includes(e.localName) && e.readOnly;
   const host = el.isContentEditable || doc.designMode === 'on';
   const mutable = el.localName === 'textarea' || (el.localName === 'input' &&
@@ -155,6 +162,15 @@ _CLEAR_CHECKS = _with_dom("""
   if (host) return el.innerHTML === '' ? 'empty' : 'clear';
   const empty = el.type === 'file' ? !el.files.length : el.value === '';
   return el.validity.valid && empty ? 'empty' : 'clear';
+""")
+
+#: Marionette's `isElementEnabled` for an element of a web page
+#: (interaction.sys.mjs, `dom.isEnabled`): never in an XML document, otherwise
+#: not `disabled`. Until 0.4.0 this was the engine's Playwright idea of enabled,
+#: which follows a label to its control and reads `aria-disabled`.
+_IS_ENABLED = _with_dom("""
+  if (doc.contentType === 'application/xml' || doc.contentType === 'text/xml') return false;
+  return !disabled(el);
 """)
 
 #: What the retry loop prints when an action on this element times out: the
@@ -282,12 +298,11 @@ class WebElement:
                    " return {v: (%s)(el, ...rest)}; }" % declaration)
         converted = [a if isinstance(a, dict) and ("objectId" in a or "value" in a)
                      else {"value": a} for a in args]
-        try:
-            remote = self._page.injected.call_raw(
-                self._ctx, wrapped, [{"objectId": self._oid}] + converted,
-                by_value=by_value)
-        except Exception as e:
-            raise _bridge.translate(e) from None
+        remote = self._engine(
+            self._page.injected.call_raw, self._ctx, wrapped,
+            [{"objectId": self._oid}] + converted, by_value=by_value)
+        if remote is None:
+            return None  # a dialog opened while it read
         value = remote.get("value") or {}
         if value.get("s"):
             raise exc.StaleElementReferenceException(
@@ -300,9 +315,21 @@ class WebElement:
         self._check_alive()
         actions = self._page.actions
         kwargs.setdefault("timeout", self._parent._action_timeout())
+        return self._engine(getattr(actions, what), _HANDLE, *args,
+                            frame_id=self._frame_id, element_id=self._oid, **kwargs)
+
+    @staticmethod
+    def _engine(call, *args, **kwargs):
+        """An engine call for this element, with Selenium's outcome: a dialog
+        that opens during it ends the command with None and stays open for
+        the next one, as Marionette ends a command when one opens
+        (`Interrupted`, `WebDriver._watch`); any other failure is Selenium's
+        exception. Until 0.4.0 a click whose alert opened raised a bare
+        WebDriverException, or waited for an answer nobody gave."""
         try:
-            return getattr(actions, what)(_HANDLE, *args, frame_id=self._frame_id,
-                                          element_id=self._oid, **kwargs)
+            return call(*args, **kwargs)
+        except Interrupted:
+            return None
         except Exception as e:
             raise _bridge.translate(e) from None
 
@@ -314,10 +341,15 @@ class WebElement:
 
     @property
     def text(self) -> str:
-        """The visible text of the element."""
-        return self._call(
-            "(el) => { const t = (typeof el.innerText === 'string')"
-            " ? el.innerText : (el.textContent || ''); return t.trim(); }")
+        """The visible text of the element, as Marionette's `getElementText`
+        answers it: Selenium's getVisibleText atom (`_atom`), and where the
+        atom fails, which it does in an XML document, the element's text
+        content, as Marionette falls back to. Until 0.4.0 this was
+        `innerText` trimmed, which keeps runs of spaces Selenium collapses."""
+        try:
+            return self._atom("getVisibleText")
+        except ProtocolError:
+            return self._call("(el) => el.textContent")
 
     def get_property(self, name) -> str | bool | WebElement | dict:
         """Gets the given property of the element."""
@@ -362,18 +394,34 @@ class WebElement:
         return bool(self._call("(el) => !!(el.selected || el.checked)"))
 
     def is_enabled(self) -> bool:
-        """Returns whether the element is enabled."""
-        return self._state("enabled")
+        """Returns whether the element is enabled, as Marionette answers
+        (`_IS_ENABLED`)."""
+        return bool(self._call(_IS_ENABLED))
 
     def is_displayed(self) -> bool:
-        """Whether the element is visible to a user."""
-        return self._state("visible")
+        """Whether the element is visible to a user, by Selenium's own rule:
+        the isDisplayed atom (`_atom`), which Selenium's client runs as a
+        script. Until 0.4.0 this was the engine's Playwright idea of visible
+        (a box with width and height), which the atom does not share: an
+        element with no height and some text is shown, one with opacity 0 or
+        moved out of reach is not."""
+        return bool(self._atom("isElementDisplayed"))
 
-    def _state(self, state: str) -> bool:
+    def _atom(self, atom: str):
+        """Firefox's own copy of a Selenium atom, on this element: the engine
+        runs it in the page's process through Xrays (`Page.elementAtom`,
+        firefox-44), so the answer is Selenium's and the page's own functions
+        are never called. Selenium runs `isDisplayed` as a script in the page,
+        where a page that replaced `getComputedStyle` counts every call: 690
+        on the bench page of 2026-10-13, where this counts 0, with the same 48
+        answers."""
         self._check_alive()
         try:
-            return bool(self._page.injected.element_state(
-                self._frame_id, self._oid, state))
+            return self._page.send("Page.elementAtom", {
+                "frameId": self._frame_id, "objectId": self._oid,
+                "atom": atom})["result"]
+        except ProtocolError:
+            raise
         except Exception as e:
             raise _bridge.translate(e) from None
 
@@ -439,19 +487,18 @@ class WebElement:
 
     @property
     def shadow_root(self):
-        """The element's OPEN shadow root.
-
-        ⛔ Open only, which is Selenium's contract as well: a closed root is
-        closed to the page's own code, and a driver that reached into it would
-        be doing something no script on the page can do."""
+        """The element's shadow root, open or closed, as Marionette's
+        `getShadowRoot` answers it (`openOrClosedShadowRoot`): the utility
+        world this element lives in reaches a closed root, and the page's own
+        code does not see it reached. None is NoSuchShadowRootException with
+        no message, as there."""
         from .shadowroot import ShadowRoot
 
         self._check_alive()
         remote = self._page.injected.call_raw(
             self._ctx, "(el) => el.shadowRoot", [{"objectId": self._oid}])
         if "objectId" not in remote:
-            raise exc.NoSuchShadowRootException(
-                "This element does not have a shadow root")
+            raise exc.NoSuchShadowRootException("")
         return ShadowRoot(self._parent, self._page, self._frame_id,
                           remote["objectId"])
 
@@ -499,10 +546,7 @@ class WebElement:
                 self._choose_this_option()
         else:
             x, y = self._in_main_frame(said["x"], said["y"])
-            try:
-                self._page.actions.click_at(x, y)
-            except Exception as e:
-                raise _bridge.translate(e) from None
+            self._engine(self._page.actions.click_at, x, y)
         self._parent._await_click_navigation(self._page, self._frame_id, previous)
 
     def _in_main_frame(self, x: float, y: float):
@@ -533,15 +577,12 @@ class WebElement:
             current = set(info["selected"])
             current ^= {info["index"]}
             wanted = sorted(current)
-        try:
-            # One turn and no actionability states: the checks were
-            # Marionette's, above.
-            self._page.actions.select_option(
-                _HANDLE, [{"index": i} for i in wanted],
-                frame_id=self._frame_id, element_id=select["objectId"],
-                timeout=self._parent._action_timeout(), once=True, force=True)
-        except Exception as e:
-            raise _bridge.translate(e) from None
+        # One turn and no actionability states: the checks were Marionette's,
+        # above. A `change` handler that alerts ends it, as a click's would.
+        self._engine(self._page.actions.select_option,
+                     _HANDLE, [{"index": i} for i in wanted],
+                     frame_id=self._frame_id, element_id=select["objectId"],
+                     timeout=self._parent._action_timeout(), once=True, force=True)
 
     def submit(self) -> None:
         """Submits a form.
@@ -552,6 +593,9 @@ class WebElement:
         started by `form.submit()` fires no submit event at all and one from
         `requestSubmit()` is not something a hand produces.
         """
+        # Selenium's submit is a script, and a script meets an open dialog
+        # first (dismissed and raised), as every command here does.
+        self._check_alive()
         found = self._page.injected.call_raw(
             self._ctx,
             "(el) => { const f = el.form || el.closest('form');"

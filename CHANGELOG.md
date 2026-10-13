@@ -2,6 +2,95 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-13
+
+The pin moves to invisible-core 44.39.0, which seals the firefox-44 engine.
+Every behaviour below was read from the original - Selenium 4.51, geckodriver
+0.37.1 and Firefox 151 - by asking it the same questions the tests ask.
+
+### Changed
+- **`element.text` and `is_displayed()` are Selenium's own atoms**:
+  getVisibleText and isDisplayed, the copies Firefox ships, run by the engine
+  in the page's process without calling any of the page's functions. On a
+  bench of 24 elements the answers are the original's, 48 of 48. Until 0.4.0
+  `text` was `innerText` trimmed (runs of spaces were kept) and
+  `is_displayed()` was "has a box with width and height" (an element with
+  opacity 0 or moved off screen was displayed, one with no height and some
+  text was not).
+- **`current_url` and `title` are read in the browser**, as Marionette reads
+  them, so a page busy in a script answers at once; `current_url` is never
+  "".
+- **`is_enabled()` is Marionette's**: the element's own `:disabled`, an option
+  through its group, and False for anything in an XML document; a label or
+  `aria-disabled` no longer counts.
+- **A dialog ends the command it opened in**, as Marionette's: a script, a
+  page load, a history step or a click that opens an `alert` returns at once
+  and leaves the dialog for the next command, which dismisses it and raises
+  `UnexpectedAlertPresentException` 'Unexpected alert dialog detected.
+  Performed handler "dismiss"' (confirm and prompt named as such). A dialog
+  during an implicit wait ends `find_element` with "Failed to convert data
+  to an object". `close`, `new_window`, the window rect, `maximize_window`,
+  `default_content`, `frame` and `submit` meet an open dialog first; the
+  window handles, `switch_to.window`, `parent_frame` and the timeouts do not.
+- **`beforeunload` is accepted at once**, so it no longer holds a navigation,
+  and **`close()` runs it**, as Firefox's own tab close does.
+- **The cookies are the current frame's**, as Marionette reads them: a
+  cookie's path counts when the document's path contains it, `secure` filters
+  nothing, `sameSite` is always there ("None" when unset), `get_cookie`
+  answers the last cookie of that name, an expiry is capped at 400 days, and
+  `add_cookie` refuses in Marionette's words ("Document is cookie-averse",
+  "Cookies may only be set for the current domain (...)"). `delete_cookie("")`
+  is the client's `ValueError`.
+- **`switch_to.frame(N)` counts the current frame's child browsing
+  contexts** in the order they were created, an iframe in a shadow root
+  included, with no implicit wait; `frame(None)` is the top document; an
+  element that does not embed a child of the current frame, an element of
+  another frame and a frame that went away answer Marionette's errors.
+- **A body geckodriver refuses is refused in its words**, with the place in
+  the JSON Selenium sends: "invalid type: integer `1`, expected a string at
+  line 1 column 21" for a cookie, "data did not match any variant of
+  untagged enum FrameId" for a frame index out of range. `new_window` takes
+  any string as its type.
+- **`Select.select_by_visible_text`** matches `normalize-space` of the
+  option's text and refuses an option hidden by its style ("Invisible option
+  with text: ..."); a disabled option already selected is left alone.
+- **`shadow_root`** answers a closed root too, and an element without one is
+  `NoSuchShadowRootException` with no message.
+
+- **An `Alert` asks for the dialog open now at every call**, as Selenium's:
+  no dialog, or one already answered, is `NoAlertPresentException` with no
+  message (it was "No dialog is present", "The dialog is no longer open", or
+  the old text), and `send_keys` on an alert or a confirm says "User prompt
+  of type alert is not interactable".
+- **`switch_to.window(name)` finds a window by its `window.name`** when no
+  handle matches, as the Selenium client does. The name is read in an
+  isolated world, so no script of the page sees the read.
+- **An unknown locator strategy is refused in geckodriver's words**:
+  "unknown variant `foo`, expected one of `css selector`, `link text`,
+  `partial link text`, `tag name`, `xpath` at line 1 column 15".
+
+### Fixed
+- **`send_keys` of text with a character the US layout has no key for
+  presses the keys that exist** and inserts that character in its place: it
+  inserted the whole text, so a page saw "café" arrive with no keystroke.
+- **The text sent to a prompt is kept until the prompt is accepted**, also
+  through another `switch_to.alert`, the usual way to write it:
+  `switch_to.alert.send_keys("x")` then `switch_to.alert.accept()` gave the
+  page the prompt's default value.
+- **On Linux, the line endings a page reads are Windows'**: a `Blob` or a
+  `File` made with `endings: "native"` turns `\n` into `\r\n`, and the text
+  of a selection across two blocks is joined by `\r\n`, as on Windows.
+- **`speechSynthesis.getVoices()` is Windows' list**: David, Mark, Zira and
+  the two Desktop voices, in that order, and none of them is the default.
+
+### Not yet as the original
+- `new_window("tab")` opens a window: every page of the engine is its own
+  window, and the tab Selenium opens hides the page it came from.
+- `ActionChains` moves like a person (a path, a pause) where Selenium moves
+  in straight 250 ms lines, and `submit()` presses the form's control where
+  Selenium fires an untrusted submit event; both are the original's shape
+  and an automation signal.
+
 ## [0.4.0] - 2026-10-13
 
 The pin moves to invisible-core 41.39.0.
